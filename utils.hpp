@@ -1,4 +1,5 @@
-#pragma once
+#ifndef __UTILS_HPP__
+#define __UTILS_HPP__
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -14,6 +15,7 @@
 #include <time.h>
 #include <fcntl.h>
 #include <dirent.h>
+#include <sys/wait.h>
 
 #define WWWROOT "www"
 #define MAX_HTTPDR 4096
@@ -28,7 +30,7 @@ using std::string;
 using std::vector;
 //错误码对应错误信息
 std::unordered_map<string,string> g_err_desc = {
-    {"200","OK"},
+    {"206","Partial Content"},
     {"400","Bad Request"},
     {"403","Forbidden"},
     {"404","Not Found"},
@@ -56,7 +58,7 @@ struct RequestInfo
     string _version;      //协议版本
     string _path_info;    //资源路径
     string _path_phys;    //请求资源的实际路径
-    string _query_string; //查询字符串
+    string _query_string; //查询字符串,就是要查询的字段
     string _error_msg;    //错误信息
     string _fsize;        //文件大小
     std::unordered_map<string,string> _hdr_list;   //整个头部信息中的键值对
@@ -96,11 +98,11 @@ public:
         ss << num;
         str = ss.str();
     }
-    static int64_t StrToDigit(string& str)
+    static int64_t StrToDigit(const string& str)
     {
         //long long int 8字节,long int 8字节
         int64_t num;
-        num = strtol(str.c_str(),NULL,16);
+        num = strtol(str.c_str(),NULL,10);
         return num;
     }
     static void MakeETag(int64_t size,int64_t ino,string& mtime,string& etag)
@@ -133,7 +135,7 @@ public:
             if(pos == string::npos){
                 break;
             }
-            list.push_back(src.substr(idx,pos - idx));
+            list.push_back(src.substr(idx,pos-idx));
             idx = pos + seg.length();
         }
         if(idx < src.length()){
@@ -165,13 +167,21 @@ public:
     {
         while(1){
             char buf[MAX_HTTPDR] = {0};
+            //将_cli_sock设成非阻塞式读
+            //int old_potion = fcntl(_cli_sock,F_GETFL);
+            //fcntl(_cli_sock,F_SETFL,old_potion | O_NONBLOCK);
+
             //从接受缓冲区中读数据,但接受缓冲区的数据还在
             int ret = recv(_cli_sock,buf,MAX_HTTPDR,MSG_PEEK);
-            if(ret <= 0){
+            if(ret < 0){
                 //EINTR读的时候被信号打断，EAGIN读的时候缓冲区没数据(非阻塞)
                 if(errno == EINTR || errno == EAGAIN)
                     continue;
                 info._error_msg = "500";
+                return false;
+            }
+            else if(ret == 0){
+                info._error_msg = "404";
                 return false;
             }
             //查看buf中是否有\r\n\r\n
@@ -188,7 +198,7 @@ public:
             //头部长度
             int handler_len = pos - buf;
             _http_header.assign(buf,handler_len);  //读handler_len个字节,没有读\r\n\r\n
-            cout << buf << endl;
+            cout << _http_header << endl;
             //从缓冲区再读一次,把头和空行都读进来,剩下的数据就是正文了
             recv(_cli_sock,buf,handler_len+4,0);
             return true;
@@ -233,7 +243,6 @@ public:
         vector<string> firstline_list;
         if(Utils::Split(hdr_list[0]," ",firstline_list) != 3){
             info._error_msg = "400";
-            cout<<"first line is not 3!!\n";
             return false;
         }
         if(PareseFirstLine(firstline_list,info) == false){
@@ -251,7 +260,6 @@ public:
     {
         //www为根目录
         string file = WWWROOT + path;
-        cout<<"PathIsLegal:   123   "<<file<<"\n";
         //返回文件信息，在一个stat结构体中
         if(stat(file.c_str(),&info._st) < 0){
             info._error_msg = "404";
@@ -262,7 +270,6 @@ public:
         realpath(file.c_str(),tmp);
         //设置文件真实路径，并将文件大小转换成字符串形式   
         info._path_phys = tmp;
-        cout<<"PathIsLegal:   "<<info._path_phys<<"\n";
         Utils::DigitToStr(info._st.st_size,info._fsize); 
 
         if(info._path_phys.find(WWWROOT) == string::npos){
@@ -320,14 +327,16 @@ public:
         string rsp_header = info._version + " 200 OK\r\n";
         string mime;
         Utils::GetMime(info._path_info,mime);
-        rsp_header += "Content-Type: " + mime + ";charset=UTF-8\r\n"; 
+        rsp_header += "Content-Type: application/octet-stream;charset=UTF-8\r\n"; 
         rsp_header += "Etag: " + _etag + "\r\n";
+        int64_t len = info._st.st_size;
+        string slen;
+        Utils::DigitToStr(len,slen);
+        rsp_header += "Content-Length: " + slen + "\r\n"; 
+        rsp_header += "Accept-Ranges: bytes\r\n";
         rsp_header += "Date: " + _date + "\r\n\r\n";
+        cout << rsp_header << endl;
         SendData(rsp_header);
-        //std::cout<<"ProcessFile:"<<rsp_header<<"\n";
-        //if(info._version == "HTTP/1.1")
-        //    rsp_header += "Transfer-Encoding: chunked\r\n";
-        string rsp_string;
         //发送文件
         int fd = open(info._path_phys.c_str(),O_RDONLY);
         if(fd < 0){
@@ -335,11 +344,9 @@ public:
             return false;
         }
         char tmp[MAX_BUFF];
-        int len;
-        while((len = read(fd,tmp,MAX_BUFF))>0){
-            //tmp[len] = 0;
-            //SendData(tmp);
-            send(_cli_sock,tmp,len,0);
+        int rlen;
+        while((rlen = read(fd,tmp,MAX_BUFF))>0){
+            send(_cli_sock,tmp,rlen,0);
         }
         close(fd);
         return true;
@@ -362,17 +369,27 @@ public:
         //if(info._version == "HTTP/1.1")
         //    rsp_header += "Transfer-Encoding: chunked\r\n";
         rsp_header += "Connextion: close\r\n\r\n";
-        cout << rsp_header ;
+        cout << rsp_header;
         SendData(rsp_header);   //头部正常传输
         
         string rsp_body;
-        rsp_body = "<html><head><title>Index of /</title>";
+        //这是网页上的一个标题
+        rsp_body = "<html><head><title>Index of " + info._path_info + "</title>";
+        //html中的信息
+        rsp_body += "<body><h1>Index of " + info._path_info + "</h1>";
+        rsp_body += "<from>";
+        //enctype 属性规定在发送到服务器之前应该如何对表单数据进行编码。
+        rsp_body += "<form action='/upload' method='POST' enctype='multipart/form-data'>";
+        rsp_body += "<input type='file' name='UpLoadFile' value='abc' />";
+        //定义上传按钮
+        rsp_body += "<input type='submit' value='上传' />";
+        rsp_body += "</form>";
         rsp_body += "<meta charset='UTF-8'></head>";
-        rsp_body += "<body><h1>Index of /</h1>";
         rsp_body += "<hr /><ol>";
         SendData(rsp_body);
         //获取目录下的每一个文件、组织处理html信息
         struct dirent** p_dirent = NULL;
+        //以alphasort为排序方法
         int num = scandir(info._path_phys.c_str(),&p_dirent,0,alphasort);
         for(int i=0; i<num; i++){
             string name = p_dirent[i]->d_name;
@@ -387,9 +404,16 @@ public:
             Utils::TimeToGMT(st.st_mtime,mtime);
             Utils::GetMime(name,mime);
             Utils::DigitToStr(st.st_size,fsize);
-            file_html += "<strong><a href='"+ info._path_info;
-            file_html += name + "'>";
-            file_html += name + "</a></strong><br />";
+            if(st.st_mode & S_IFDIR){
+                file_html += "<strong><a href='"+ info._path_info;
+                file_html += name + "'>";
+                file_html += name + "</a></strong><br />";
+            }
+            else{
+                file_html += "<a href='"+ info._path_info;
+                file_html += name + "'>";
+                file_html += name + "</a><br />";
+            }
             file_html += "<small>";
             file_html += "Modified: " + mtime + "<br />";
             file_html += mime + "-" + fsize + " kbytes";
@@ -433,16 +457,24 @@ public:
         //流程：创建管道，创建子进程，设置子进程环境变量，程序替换
         int in[2];  //用于向子进程传输数据
         int out[2]; //用于从子进程中读取处理结果
-        if(pipe(in) || pipe(out)){
+        if(pipe(in) < 0){
             info._error_msg = "500";
+            cout << "pipe error! " << endl;
             return false;
         }
-        int pid = fork();
+        if(pipe(out) < 0){
+            info._error_msg = "500";
+            cout << "pipe error! " << endl;
+            return false;
+        }
+        pid_t pid = fork();
         if(pid < 0){
             info._error_msg = "500";
+            cout << "fork error! " << endl;
             return false;
         }
         else if(pid == 0){
+            //设置环境变量，传递请求信息
             setenv("METHOD",info._method.c_str(),1);
             setenv("VERSION",info._version.c_str(),1);
             setenv("PATH_INFO",info._path_info.c_str(),1);
@@ -454,29 +486,51 @@ public:
             }
             close(in[1]);
             close(out[0]);
-            dup2(in[0],0);  //把管道输入重定向到标准输入
-            dup2(out[1],1); //把管道输出重定向到标准输出
+            dup2(in[0],0);  //把管道输入重定向到标准输入,从0里边读,就相当从in[0]里边读 
+            dup2(out[1],1); //把管道输出重定向到标准输出,往1里边写,就相当往out[1]里边写
+            //第一个参数，是程序路径，其余是命令行参数，以NULL结尾
             execl(info._path_phys.c_str(),info._path_phys.c_str(),NULL);
             exit(0);
         }
         close(in[0]);
         close(out[1]);
         //1.通过in管道将正文数据传递给子进程
-        auto it = info._hdr_list.find("Connect-Length");
+        auto it = info._hdr_list.find("Content-Length");
         if(it != info._hdr_list.end()){
             char buf[MAX_BUFF] = {0};
-            int64_t content_len = Utils::StrToDigit(it->second);
-            int rlen = recv(_cli_sock,buf,MAX_BUFF,0);
-            if(rlen <= 0){
-                return false;
-            }
-            if(write(in[1],buf,rlen) < 0){
-                return false;
+            int content_len = Utils::StrToDigit(it->second);
+            //LOG("\nFather Content-Length[%d]:\n",content_len);
+            int rlen = 0;
+            while(rlen < content_len){
+                int len = MAX_BUFF > (content_len - rlen) ? (content_len - rlen):(MAX_BUFF);
+                int read_len = recv(_cli_sock,buf,len,0);
+                //cerr << "Father: "<< endl;
+                //cerr << buf << endl;
+                //cerr << "完了" << endl;
+                if(rlen < 0){
+                    info._error_msg = "500";
+                    return false;
+                }
+                rlen += read_len;
+                //管道写满了，会阻塞
+                if(write(in[1],buf,read_len) < 0){
+                    info._error_msg = "500";
+                    LOG("write error :%s\n",strerror(errno)); 
+                    return false;
+                }
             }
         }
         //2.通过out管道读取处理结果，直到返回0
         //3.将处理结果组织成http数据，响应给客户端
         string rsp_header;
+        //rsp_header = info._version + " 206 Partial Content\r\n";
+        rsp_header = info._version + " 200 OK\r\n";
+        rsp_header += "Content-Type: text/html;charset=UTF-8\r\n"; 
+        rsp_header += "Etag: " + _etag + "\r\n";
+        rsp_header += "Date: " + _date + "\r\n";
+        //if(info._version == "HTTP/1.1")
+        //    rsp_header += "Transfer-Encoding: chunked\r\n";
+        rsp_header += "Connextion: close\r\n\r\n";
         SendData(rsp_header);
 
         while(1){
@@ -484,14 +538,15 @@ public:
             int len = read(out[0],buf,MAX_BUFF);
             if(len == 0)
                 break;
-            SendData(buf);
-            //send(_cli_sock,buf,len,0);
+            //SendData(buf);
+            send(_cli_sock,buf,len,0);
         }
-        string rsp_body;
-        rsp_body = "<html><body><h1>";
-        SendData(rsp_body);
+        close(in[1]);
+        close(out[0]);
+        waitpid(pid,NULL,0);
         return true;
     }
+    //外部处理程序
     bool CGIHandler(RequestInfo& info)	 //处理正常请求
     {
     	InitResponse(info);
@@ -504,15 +559,17 @@ public:
     {
     	InitResponse(info);
     	if(FileIsDir(info)){		//判断请求文件是否是目录文件
-    	    ProcessList(info);	//处理文件列表响应
-    	}
+    	    if(ProcessList(info))	//处理文件列表响应
+    	        return true;
+            ErrHandler(info);
+            return false;
+        }
     	else{
-    	   if( ProcessFile(info))	//处理文件下载响应
+    	   if(ProcessFile(info))	//处理文件下载响应
                return true;
            ErrHandler(info);
            return false;
     	}
-        return true;
     }
     bool ErrHandler(RequestInfo& info)  //处理错误响应
     {
@@ -520,7 +577,6 @@ public:
         //头部 Content-Length Date
         //空行
         //正文 rsp_header = "<html><body><h1>404;<h1></body></html>"
-        std::cout<<"Errhandler\n";
         //构造响应正文
         string rsp_body;
         rsp_body = "<html><body><h1>" + info._error_msg;
@@ -541,30 +597,9 @@ public:
         string gmt;
         Utils::TimeToGMT(t,gmt);
         rsp_header += "Date: " + gmt + "\r\n\r\n";
-        cout<<rsp_header<<rsp_body;
         SendData(rsp_header);
         SendCData(rsp_body);
         return true;
     } 
 };
-class UpLoad
-{
-private:
-    int _file_fd;
-    bool _is_store_file;
-    string _content_length;
-    string file_name;
-    string _first_boundry;
-    string _middle_boundry;
-    string _last_boundry;
-public:
-    bool InitUpLoadInfo()  //初始化UpLoad数据
-    {
-        return true;    
-    }
-    bool ProcessUpLoad()	//完成文件的上传存储功能
-    {
-        return true;
-    }
-};
-
+#endif //__UTILS_HPP__
