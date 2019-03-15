@@ -31,6 +31,7 @@ using std::vector;
 //错误码对应错误信息
 std::unordered_map<string,string> g_err_desc = {
     {"206","Partial Content"},
+    {"304","Not Modified"},
     {"400","Bad Request"},
     {"403","Forbidden"},
     {"404","Not Found"},
@@ -105,7 +106,7 @@ public:
         num = strtol(str.c_str(),NULL,10);
         return num;
     }
-    static void MakeETag(int64_t size,int64_t ino,string& mtime,string& etag)
+    static void MakeETag(int64_t size,int64_t ino,time_t& mtime,string& etag)
     {
         std::stringstream ss;
         ss << "\"";
@@ -168,8 +169,8 @@ public:
         while(1){
             char buf[MAX_HTTPDR] = {0};
             //将_cli_sock设成非阻塞式读
-            //int old_potion = fcntl(_cli_sock,F_GETFL);
-            //fcntl(_cli_sock,F_SETFL,old_potion | O_NONBLOCK);
+            int old_potion = fcntl(_cli_sock,F_GETFL);
+            fcntl(_cli_sock,F_SETFL,old_potion | O_NONBLOCK);
 
             //从接受缓冲区中读数据,但接受缓冲区的数据还在
             int ret = recv(_cli_sock,buf,MAX_HTTPDR,MSG_PEEK);
@@ -287,7 +288,7 @@ private:
     //客户端如果请求相同的文件，且服务器端对该文件没有任何修改，就不用再次返回该文件了
     //ETag:"inode-fsize-mtime"可判断是否修改过该文件
     string _etag;		//查看文件是否被修改过
-    string _mtime;		//文件最后一次修改时间
+    time_t _mtime;		//文件最后一次修改时间
     string _date;               //系统的响应时间
 public:
     HttpResponse(int cli_sock):_cli_sock(cli_sock){}
@@ -297,8 +298,8 @@ public:
         int64_t size = req_info._st.st_size;
         int64_t ino = req_info._st.st_ino;
         
-        //把文件最后修改时间弄成GMT时间
-        Utils::TimeToGMT(req_info._st.st_mtime,_mtime);
+        //把文件最后修改时间
+        _mtime = req_info._st.st_mtime;
         
         //ETag,将文件大小，inode号，文件最后一次修改时间弄在一起放入Etag中
         Utils::MakeETag(size, ino, _mtime, _etag);
@@ -321,8 +322,103 @@ public:
         }
         return false;
     }
+    bool BreakPointResume(RequestInfo& info)
+    {
+        string if_range = info._hdr_list.find("If-Range")->second;
+        auto it = info._hdr_list.find("Range");
+        if(it == info._hdr_list.end()){
+            return false;
+        }
+        string bytes = it->second;
+        size_t pos = bytes.find("bytes=");
+        size_t post = bytes.find('-');
+        if(post == string::npos)
+            return false;
+        //from pos+6 cai pos1-pos  
+        string start = bytes.substr(pos+6,post-(pos+6));
+        //cerr << "start: " << start << endl;
+        string end = bytes.substr(post+1);
+        //cerr << "end: " << end << endl;
+        int64_t finnal;
+        if(end.empty()){
+            finnal = info._st.st_size-1;
+        }
+        else{
+            finnal = Utils::StrToDigit(end);
+        }
+        int64_t begin = Utils::StrToDigit(start);
+        //cerr << "begin: " << begin << endl;
+        //cerr << "finnal: " << finnal << endl;
+        size_t byte = finnal - begin + 1;
+        //cerr << "byte: " << byte << endl;
+        //组织html头部
+        string status = g_err_desc.find("206")->second;
+        string rsp_header = info._version + " 206 " + status + "\r\n";
+        rsp_header += "Content-Type: application/octet-stream\r\n"; 
+        //标志文件是否被修改
+        rsp_header += "Etag: " + _etag + "\r\n";
+        //文件大小
+        string slen;
+        Utils::DigitToStr(byte,slen);
+        rsp_header += "Content-Length: " + slen + "\r\n"; 
+        //file size
+        int64_t fsize = info._st.st_size;
+        Utils::DigitToStr(fsize,slen);
+
+        Utils::DigitToStr(begin,start);
+        //finnal = begin + rlen*len - 1; 
+        Utils::DigitToStr(finnal,end);
+
+        rsp_header += "Content-Range: bytes " + start + "-" + end + "/" + slen + "\r\n";
+        rsp_header += "Accept-Ranges: bytes\r\n";
+        rsp_header += "Last-Modified: " + _date + "\r\n\r\n";
+        SendData(rsp_header);
+        cout << rsp_header << endl;
+        //发送文件
+        int fp = open(info._path_phys.c_str(),O_RDONLY);
+        if(fp < 0){
+            info._error_msg = "400";
+            cerr << "open error!" << endl;
+            return false;
+        }
+        lseek(fp,begin,SEEK_SET);
+        //cerr << "seek: " << ftell(fp) << endl; 
+        char tmp[MAX_BUFF];
+        size_t clen = 0;
+        size_t rlen = 0;
+        while(clen < byte){
+            int len = (byte - clen) > (MAX_BUFF-1) ? (MAX_BUFF-1) : (byte-clen);
+            rlen = read(fp,tmp,len);
+            //clen += (rlen*len);
+            clen += rlen;
+            send(_cli_sock,tmp,rlen,0);
+        }
+        cerr << "clen: " << clen << endl;
+        close(fp);
+        return true;
+    }
     bool ProcessFile(RequestInfo& info) //文件下载
     {
+        auto it = info._hdr_list.find("If-Range");
+        if(it != info._hdr_list.end()){
+           // cerr << "========================" << endl;
+           // cerr << it->second << endl;
+            string if_range = it->second;
+            string etag_tmp = _etag;
+           // cerr << etag_tmp << endl;
+            if(etag_tmp == if_range){
+                //执行断点续传功能
+                //string rsp_body = "<html><body><h1>304";
+                //rsp_body += "<h1></body></html>\r\n";
+                //send(_cli_sock,rsp_body.c_str(),rsp_body.length(),0);
+                if(BreakPointResume(info)){
+                    return true;
+                }
+                info._error_msg = "404";
+                ErrHandler(info);
+                return false;
+            }
+        }
         //组织html头部
         string rsp_header = info._version + " 200 OK\r\n";
         string mime;
@@ -504,9 +600,6 @@ public:
             while(rlen < content_len){
                 int len = MAX_BUFF > (content_len - rlen) ? (content_len - rlen):(MAX_BUFF);
                 int read_len = recv(_cli_sock,buf,len,0);
-                //cerr << "Father: "<< endl;
-                //cerr << buf << endl;
-                //cerr << "完了" << endl;
                 if(rlen < 0){
                     info._error_msg = "500";
                     return false;
@@ -523,7 +616,6 @@ public:
         //2.通过out管道读取处理结果，直到返回0
         //3.将处理结果组织成http数据，响应给客户端
         string rsp_header;
-        //rsp_header = info._version + " 206 Partial Content\r\n";
         rsp_header = info._version + " 200 OK\r\n";
         rsp_header += "Content-Type: text/html;charset=UTF-8\r\n"; 
         rsp_header += "Etag: " + _etag + "\r\n";

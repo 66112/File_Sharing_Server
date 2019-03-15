@@ -1,4 +1,5 @@
-#pragma once 
+#ifndef __SHARED_FILE_SERVER_HPP__
+#define __SHARED_FILE_SERVER_HPP__
 #include <iostream>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -10,6 +11,7 @@
 
 #define MAX_LISTEN 5
 #define MAX_THREAD_NUM 3
+
 class Sock
 {
 private:
@@ -21,6 +23,8 @@ public:
     {}
     bool Socket()
     {
+        //非阻塞
+        //_fd = socket(AF_INET,SOCK_NONBLOCK | SOCK_STREAM,0);
         _fd = socket(AF_INET,SOCK_STREAM,0);
         if(_fd < 0){
             //cerr << "socket error" << endl;
@@ -100,7 +104,7 @@ public:
             int new_sock = _listen_sock.Accept(&client,&len);
             if(new_sock < 0){
                 //cerr << "acept failure!" << endl;
-                LOG("accept error :%s\n",strerror(errno));
+                //LOG("accept error :%s\n",strerror(errno));
                 continue;
             }
             Service(new_sock);
@@ -116,9 +120,6 @@ public:
     /////////////////////////////////////////////
     static bool handler(int new_sock)   //任务处理函数
     {
-        static int count = 0;
-        count++;
-        std::cout<<"this is the "<<count<<" th run this func\n";
         RequestInfo info;                //解析后的请求信息
         HttpReQuest req(new_sock);       //请求信息
         HttpResponse rsp(new_sock);      //响应信息
@@ -145,8 +146,7 @@ public:
         rsp.ErrHandler(info);
         close(new_sock);
         return true;
-
      }
 };
 
-
+#endif //__SHARED_FILE_SERVER_HPP__
